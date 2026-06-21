@@ -1,5 +1,7 @@
 from typing import List, Optional, Tuple
 import logging
+import secrets
+from datetime import datetime
 
 from .schemas import (
     TranscriptSegment,
@@ -40,6 +42,12 @@ RECORDING_NOTICE_POSITIVE_KEYWORDS = [
     "被录音", "录音告知", "录音提示",
     "为了保证服务质量", "为了保障您的权益", "服务质量监督",
 ]
+
+
+def _gen_risk_id() -> str:
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    rand = secrets.token_hex(3).upper()
+    return f"RISK_{ts}_{rand}"
 
 
 class RiskRule:
@@ -119,6 +127,7 @@ class ComplianceEngine:
                     continue
                 seen.add(dedup_key)
                 risks.append(RiskFragment(
+                    risk_id=_gen_risk_id(),
                     segment_index=idx,
                     original_text=seg.text,
                     speaker=seg.speaker,
@@ -129,7 +138,6 @@ class ComplianceEngine:
                     matched_keywords=matched_kw,
                     suggestion=rule.suggestion,
                 ))
-                break
 
         if not _has_recording_notice(segments):
             first_agent_idx = next(
@@ -141,6 +149,7 @@ class ComplianceEngine:
                 if dedup_key not in seen:
                     first_seg = segments[first_agent_idx]
                     risks.append(RiskFragment(
+                        risk_id=_gen_risk_id(),
                         segment_index=first_agent_idx,
                         original_text=first_seg.text,
                         speaker=first_seg.speaker,

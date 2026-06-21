@@ -1,15 +1,19 @@
 import asyncio
 import json
 import logging
+import socket
 import time
 import uuid
 from datetime import datetime
 from typing import Optional, Tuple, List
 from urllib.parse import urlparse
+import urllib.request
+import urllib.error
 
 from .schemas import (
     TaskStatus,
     CallType,
+    FailureType,
     RiskConclusion,
     CallbackStatus,
     CallbackRecord,
@@ -19,6 +23,7 @@ from .schemas import (
     RiskAnalysisResponse,
     RiskFragment,
     RiskConclusionUpdateRequest,
+    SupervisorStatsResponse,
     TaskListResponse,
     RiskLevel,
     RiskCategory,
@@ -29,6 +34,8 @@ from .asr_service import get_asr_service, ASRError, RecordingURLError, Transcrip
 from .compliance_engine import get_compliance_engine
 
 logger = logging.getLogger(__name__)
+
+_CALLBACK_TIMEOUT_SEC = 5
 
 
 class TaskProcessor:
@@ -66,9 +73,13 @@ class TaskProcessor:
             "high_risk_count": high,
             "medium_risk_count": medium,
             "low_risk_count": low,
+            "failure_type": task.failure_type.value if task.failure_type else None,
+            "failure_reason": task.failure_reason,
+            "suggest_retry": task.suggest_retry,
             "error_message": task.error_message,
             "top_risks": [
                 {
+                    "risk_id": r.risk_id,
                     "segment_index": r.segment_index,
                     "risk_category": r.risk_category.value,
                     "risk_level": r.risk_level.value,
@@ -79,12 +90,10 @@ class TaskProcessor:
             ],
         }
 
-    async def _send_callback_once(
+    def _send_http_callback_sync(
         self,
         callback_url: str,
         payload: dict,
-        task_id: str,
-        attempt: int,
     ) -> Tuple[CallbackStatus, Optional[int], Optional[str], Optional[str], int]:
         start_ts = time.time()
         http_status: Optional[int] = None
@@ -92,44 +101,95 @@ class TaskProcessor:
         err_msg: Optional[str] = None
         final_status = CallbackStatus.FAILED
 
-        parsed = urlparse(callback_url)
-        host_lower = (parsed.hostname or "").lower()
-
-        if any(kw in host_lower for kw in ("timeout", "timedout", "time-out")):
-            await asyncio.sleep(0.5)
-            err_msg = "回调连接超时 (1000ms timeout exceeded)"
-        elif any(kw in host_lower for kw in ("fail", "error", "broken", "500", "502", "503", "504")):
-            await asyncio.sleep(0.05)
-            http_status = 500
-            resp_body = '{"status":"error","message":"internal server error"}'
-            err_msg = "回调服务器返回 HTTP 500"
-        elif any(kw in host_lower for kw in ("success", "ok", "200", "mock-callback")):
-            await asyncio.sleep(0.05)
-            http_status = 200
-            resp_body = '{"success":true,"received_at":"' + datetime.now().isoformat() + '"}'
-            final_status = CallbackStatus.SUCCESS
-        else:
-            await asyncio.sleep(0.1)
-            http_status = 200
-            resp_body = (
-                '{"success":true,"message":"mock received","task_id":"'
-                + task_id
-                + '","attempt":'
-                + str(attempt)
-                + "}"
+        try:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                callback_url,
+                data=data,
+                headers={
+                    "Content-Type": "application/json; charset=utf-8",
+                    "User-Agent": "ComplianceASR-Callback/1.0",
+                    "X-Task-Id": payload.get("task_id", ""),
+                    "X-Event": payload.get("event", "task_finished"),
+                },
+                method="POST",
             )
-            final_status = CallbackStatus.SUCCESS
+            with urllib.request.urlopen(req, timeout=_CALLBACK_TIMEOUT_SEC) as resp:
+                http_status = resp.status
+                raw = resp.read(512).decode("utf-8", errors="replace")
+                resp_body = raw[:500] if raw else None
+                if 200 <= resp.status < 300:
+                    final_status = CallbackStatus.SUCCESS
+                else:
+                    final_status = CallbackStatus.FAILED
+                    err_msg = f"回调服务器返回非 2xx 状态码 HTTP {resp.status}"
+        except urllib.error.HTTPError as e:
+            http_status = e.code
+            try:
+                raw = e.read(512).decode("utf-8", errors="replace")
+                resp_body = raw[:500] if raw else None
+            except Exception:
+                resp_body = None
+            err_msg = f"回调服务器返回 HTTP {e.code} {e.reason}"
+            final_status = CallbackStatus.FAILED
+        except urllib.error.URLError as e:
+            reason = e.reason
+            if isinstance(reason, socket.timeout):
+                err_msg = f"回调连接超时（>{_CALLBACK_TIMEOUT_SEC}s）"
+            elif isinstance(reason, ConnectionRefusedError):
+                err_msg = "回调地址连接被拒绝（Connection refused）"
+            elif isinstance(reason, OSError):
+                err_msg = f"回调网络错误: {reason}"
+            else:
+                err_msg = f"回调 URL 错误: {reason}"
+            final_status = CallbackStatus.FAILED
+        except socket.timeout:
+            err_msg = f"回调连接超时（>{_CALLBACK_TIMEOUT_SEC}s）"
+            final_status = CallbackStatus.FAILED
+        except Exception as e:
+            err_msg = f"回调发送异常: {type(e).__name__}: {e}"
+            final_status = CallbackStatus.FAILED
 
         duration_ms = int((time.time() - start_ts) * 1000)
         return final_status, http_status, resp_body, err_msg, duration_ms
 
-    async def _dispatch_callback(self, task: TranscriptionTask) -> None:
+    async def _send_callback_once(
+        self,
+        callback_url: str,
+        payload: dict,
+        task_id: str,
+        attempt: int,
+    ) -> Tuple[CallbackStatus, Optional[int], Optional[str], Optional[str], int]:
+        parsed = urlparse(callback_url)
+        host_lower = (parsed.hostname or "").lower()
+
+        if any(kw in host_lower for kw in ("mock-callback", "mock-cb", "200.ok", "success.callback")):
+            start_ts = time.time()
+            await asyncio.sleep(0.05)
+            resp_body = '{"success":true,"received_at":"' + datetime.now().isoformat() + '","mode":"mock"}'
+            duration_ms = int((time.time() - start_ts) * 1000)
+            return CallbackStatus.SUCCESS, 200, resp_body, None, duration_ms
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._send_http_callback_sync(callback_url, payload),
+        )
+
+    async def _dispatch_callback(
+        self,
+        task: TranscriptionTask,
+        triggered_by: str = "auto",
+        max_attempts: int = 3,
+    ) -> None:
         if not task.callback_url:
             return
 
         payload = self._build_callback_payload(task)
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
+        existing = len(task.callbacks)
+
+        for attempt_offset in range(max_attempts):
+            attempt = existing + attempt_offset + 1
             record_id = f"CB_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6].upper()}"
             sent_at = datetime.now()
 
@@ -144,8 +204,9 @@ class TaskProcessor:
                 callback_url=task.callback_url,
                 status=status,
                 attempt=attempt,
+                triggered_by=triggered_by,
                 http_status_code=http_code,
-                response_body=resp_body[:200] if resp_body else None,
+                response_body=resp_body[:500] if resp_body else None,
                 error_message=err_msg,
                 sent_at=sent_at,
                 completed_at=completed_at,
@@ -169,10 +230,39 @@ class TaskProcessor:
             logger.warning(
                 f"Callback for task {task.task_id} attempt {attempt} failed: {err_msg}"
             )
-            if attempt < max_attempts:
-                await asyncio.sleep(1 * attempt)
+            if attempt_offset + 1 < max_attempts:
+                await asyncio.sleep(1 * (attempt_offset + 1))
 
         logger.error(f"Callback for task {task.task_id} failed after {max_attempts} attempts")
+
+    def _set_task_failure(
+        self,
+        task: TranscriptionTask,
+        exc: Exception,
+        default_type: FailureType = FailureType.UNKNOWN,
+        default_reason: Optional[str] = None,
+        default_suggest_retry: bool = True,
+    ) -> None:
+        task.status = TaskStatus.FAILED
+        task.error_message = default_reason or str(exc)
+        task.completed_at = datetime.now()
+
+        if isinstance(exc, ASRError):
+            task.failure_type = exc.failure_type
+            task.failure_reason = exc.failure_reason
+            task.suggest_retry = exc.suggest_retry
+        elif isinstance(exc, RecordingURLError):
+            task.failure_type = FailureType.RECORDING_UNREACHABLE
+            task.failure_reason = default_reason or "录音地址无法访问"
+            task.suggest_retry = False
+        elif isinstance(exc, TranscriptionFailedError):
+            task.failure_type = FailureType.RECORDING_CORRUPTED
+            task.failure_reason = default_reason or "录音文件转写失败（文件可能已损坏或格式不支持）"
+            task.suggest_retry = False
+        else:
+            task.failure_type = default_type
+            task.failure_reason = default_reason or f"处理异常：{type(exc).__name__}"
+            task.suggest_retry = default_suggest_retry
 
     async def _process_task(self, task_id: str):
         task = self.storage.get_task(task_id)
@@ -208,34 +298,67 @@ class TaskProcessor:
 
         except RecordingURLError as e:
             logger.error(f"Task {task_id} recording URL error: {e}")
-            task.status = TaskStatus.FAILED
-            task.error_message = f"录音地址无效: {e}"
-            task.completed_at = datetime.now()
+            self._set_task_failure(
+                task, e,
+                default_type=FailureType.RECORDING_UNREACHABLE,
+                default_reason=f"录音地址无效: {e}",
+                default_suggest_retry=False,
+            )
             self.storage.update_task(task)
 
         except TranscriptionFailedError as e:
             logger.error(f"Task {task_id} transcription failed: {e}")
-            task.status = TaskStatus.FAILED
-            task.error_message = f"转写失败: {e}"
-            task.completed_at = datetime.now()
+            self._set_task_failure(
+                task, e,
+                default_type=FailureType.RECORDING_CORRUPTED,
+                default_reason=f"转写失败: {e}",
+                default_suggest_retry=False,
+            )
             self.storage.update_task(task)
 
         except ASRError as e:
             logger.error(f"Task {task_id} ASR error: {e}")
-            task.status = TaskStatus.FAILED
-            task.error_message = f"语音识别服务异常: {e}"
-            task.completed_at = datetime.now()
+            self._set_task_failure(
+                task, e,
+                default_type=FailureType.ASR_SERVICE_ERROR,
+                default_reason=f"语音识别服务异常: {e}",
+                default_suggest_retry=True,
+            )
             self.storage.update_task(task)
 
         except Exception as e:
             logger.exception(f"Task {task_id} unexpected error")
-            task.status = TaskStatus.FAILED
-            task.error_message = f"处理异常: {e}"
-            task.completed_at = datetime.now()
+            self._set_task_failure(
+                task, e,
+                default_type=FailureType.ANALYSIS_ERROR,
+                default_reason=f"处理异常: {type(e).__name__}: {e}",
+                default_suggest_retry=True,
+            )
             self.storage.update_task(task)
 
         finally:
-            asyncio.create_task(self._dispatch_callback(task))
+            asyncio.create_task(self._dispatch_callback(task, triggered_by="auto"))
+
+    def retry_callback(
+        self,
+        task_id: str,
+        callback_record_id: Optional[str] = None,
+        reviewer: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str], Optional[CallbackListResponse]]:
+        task = self.storage.get_task(task_id)
+        if not task:
+            return False, f"任务 {task_id} 不存在", None
+        if not task.callback_url:
+            return False, f"任务 {task_id} 未配置回调地址", None
+        if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            return False, f"任务尚未结束（当前状态: {task.status.value}），暂无法回调", None
+
+        asyncio.create_task(
+            self._dispatch_callback(task, triggered_by="manual" if reviewer else "manual", max_attempts=1)
+        )
+        logger.info(f"Manual callback retry triggered for task {task_id} by {reviewer or 'unknown'}")
+        history = self.get_callback_history(task_id)
+        return True, None, history
 
     def get_task_status(self, task_id: str) -> Optional[TranscriptResult]:
         task = self.storage.get_task(task_id)
@@ -296,10 +419,10 @@ class TaskProcessor:
             risks=risks,
         )
 
-    def update_risk_conclusion(
+    def update_risk_conclusion_by_risk_id(
         self,
         task_id: str,
-        segment_index: int,
+        risk_id: str,
         update: RiskConclusionUpdateRequest,
     ) -> Tuple[bool, Optional[str], Optional[RiskAnalysisResponse]]:
         task = self.storage.get_task(task_id)
@@ -311,12 +434,12 @@ class TaskProcessor:
 
         target: Optional[RiskFragment] = None
         for r in task.risks:
-            if r.segment_index == segment_index:
+            if r.risk_id == risk_id:
                 target = r
                 break
 
         if target is None:
-            return False, f"未找到 segment_index={segment_index} 的风险片段", None
+            return False, f"未找到 risk_id={risk_id} 的风险片段", None
 
         target.conclusion = update.conclusion
         target.reviewer = update.reviewer
@@ -370,6 +493,22 @@ class TaskProcessor:
             page=page,
             page_size=page_size,
             items=items,
+        )
+
+    def supervisor_stats(
+        self,
+        date_from: str,
+        date_to: str,
+        agent_id: Optional[str] = None,
+        call_type: Optional[CallType] = None,
+        group_by: str = "agent",
+    ) -> SupervisorStatsResponse:
+        return self.storage.aggregate_supervisor_stats(
+            date_from=date_from,
+            date_to=date_to,
+            agent_id=agent_id,
+            call_type=call_type,
+            group_by=group_by,
         )
 
 

@@ -53,6 +53,14 @@ class CallbackStatus(str, Enum):
     FAILED = "failed"
 
 
+class FailureType(str, Enum):
+    RECORDING_UNREACHABLE = "recording_unreachable"
+    RECORDING_CORRUPTED = "recording_corrupted"
+    ASR_SERVICE_ERROR = "asr_service_error"
+    ANALYSIS_ERROR = "analysis_error"
+    UNKNOWN = "unknown"
+
+
 class TranscriptSegment(BaseModel):
     start_time: float = Field(..., description="片段开始时间（秒）")
     end_time: float = Field(..., description="片段结束时间（秒）")
@@ -71,7 +79,8 @@ class TranscriptSegment(BaseModel):
 
 
 class RiskFragment(BaseModel):
-    segment_index: int = Field(..., description="对应转写片段的索引")
+    risk_id: str = Field(..., description="风险片段唯一编号（格式 RISK_时间戳_6位随机）")
+    segment_index: int = Field(..., description="对应转写片段的索引（同一 segment 可能有多条风险）")
     original_text: str = Field(..., description="原始文本")
     speaker: Speaker = Field(..., description="说话人")
     start_time: float = Field(..., description="开始时间（秒）")
@@ -88,8 +97,9 @@ class RiskFragment(BaseModel):
     class Config:
         json_schema_extra = {
             "example": {
+                "risk_id": "RISK_20240115143500_A1B2C3",
                 "segment_index": 5,
-                "original_text": "您加我微信吧，微信号是abc123",
+                "original_text": "您加我微信吧，微信号是abc123，而且我保证年化20%以上",
                 "speaker": "agent",
                 "start_time": 45.2,
                 "end_time": 52.8,
@@ -158,7 +168,10 @@ class TranscriptResult(BaseModel):
     segments: List[TranscriptSegment] = Field(default_factory=list, description="带时间戳的对话文本")
     has_risk: bool = Field(False, description="是否检测到风险")
     callback_url: Optional[str] = Field(None, description="回调地址")
-    error_message: Optional[str] = Field(None, description="错误信息（任务失败时）")
+    error_message: Optional[str] = Field(None, description="错误信息（任务失败时，内部详细信息）")
+    failure_type: Optional[FailureType] = Field(None, description="失败分类：recording_unreachable/recording_corrupted/asr_service_error/analysis_error/unknown")
+    failure_reason: Optional[str] = Field(None, description="面向合规岗的可读失败原因")
+    suggest_retry: Optional[bool] = Field(None, description="是否建议重试（地址/文件问题建议不重试，服务异常建议重试）")
 
 
 class RiskAnalysisResponse(BaseModel):
@@ -197,9 +210,10 @@ class CallbackRecord(BaseModel):
     callback_url: str = Field(..., description="回调地址")
     status: CallbackStatus = Field(..., description="回调状态")
     attempt: int = Field(1, description="第几次尝试")
+    triggered_by: str = Field("auto", description="触发方式：auto 自动 / manual 手动重试")
     http_status_code: Optional[int] = Field(None, description="HTTP 响应状态码")
-    response_body: Optional[str] = Field(None, description="响应内容（截断前200字符）")
-    error_message: Optional[str] = Field(None, description="错误信息")
+    response_body: Optional[str] = Field(None, description="响应内容（截断前500字符）")
+    error_message: Optional[str] = Field(None, description="错误信息（超时/连接拒绝等）")
     sent_at: Optional[datetime] = Field(None, description="发起时间")
     completed_at: Optional[datetime] = Field(None, description="完成时间")
     duration_ms: Optional[int] = Field(None, description="耗时（毫秒）")
@@ -213,6 +227,7 @@ class CallbackRecord(BaseModel):
                 "callback_url": "https://crm.example.com/api/callbacks/compliance",
                 "status": "success",
                 "attempt": 1,
+                "triggered_by": "auto",
                 "http_status_code": 200,
                 "response_body": "{\"success\":true,\"received_at\":\"...\"}",
                 "error_message": None,
@@ -229,6 +244,10 @@ class CallbackRecord(BaseModel):
                 },
             }
         }
+
+
+class CallbackRetryRequest(BaseModel):
+    reviewer: Optional[str] = Field(None, description="操作人（手动重试触发者）")
 
 
 class CallbackListResponse(BaseModel):
@@ -252,9 +271,13 @@ class TaskSummary(BaseModel):
     risk_count: int = Field(0, description="风险片段总数")
     high_risk_count: int = Field(0, description="高风险及以上数量")
     unhandled_risk_count: int = Field(0, description="未处理风险数量")
+    confirmed_risk_count: int = Field(0, description="确认违规数量")
     has_callback: bool = Field(False, description="是否配置回调")
     last_callback_status: Optional[CallbackStatus] = Field(None, description="最近一次回调状态")
-    error_message: Optional[str] = Field(None, description="错误信息")
+    error_message: Optional[str] = Field(None, description="内部错误信息")
+    failure_type: Optional[FailureType] = Field(None, description="失败分类（列表页直接看）")
+    failure_reason: Optional[str] = Field(None, description="可读失败原因（列表页直接看）")
+    suggest_retry: Optional[bool] = Field(None, description="是否建议重试")
 
 
 class TaskListResponse(BaseModel):
@@ -262,3 +285,28 @@ class TaskListResponse(BaseModel):
     page: int = Field(1, description="当前页")
     page_size: int = Field(20, description="每页数量")
     items: List[TaskSummary] = Field(default_factory=list, description="任务列表")
+
+
+class AgentDailyStats(BaseModel):
+    agent_id: str = Field(..., description="坐席编号")
+    call_type: Optional[CallType] = Field(None, description="通话类型（按类型分组时返回）")
+    date: str = Field(..., description="日期 YYYY-MM-DD")
+    total_tasks: int = Field(0, description="任务总量")
+    failed_tasks: int = Field(0, description="失败任务量")
+    failed_rate: float = Field(0.0, description="失败率 (0-1)")
+    tasks_with_risk: int = Field(0, description="有风险的任务量")
+    risk_rate: float = Field(0.0, description="风险率 (0-1)")
+    total_risks: int = Field(0, description="风险片段总数")
+    confirmed_violations: int = Field(0, description="确认违规数量")
+    unhandled_risks: int = Field(0, description="未处理风险数量")
+
+
+class SupervisorStatsResponse(BaseModel):
+    date_from: str = Field(..., description="统计起始日期（含）")
+    date_to: str = Field(..., description="统计结束日期（含）")
+    group_by: str = Field("agent", description="聚合维度：agent / agent_call_type")
+    total_tasks: int = Field(0, description="全量任务数")
+    total_failed: int = Field(0, description="全量失败数")
+    total_risks: int = Field(0, description="全量风险片段数")
+    total_confirmed: int = Field(0, description="全量确认违规数")
+    items: List[AgentDailyStats] = Field(default_factory=list, description="按坐席/类型分组的统计")

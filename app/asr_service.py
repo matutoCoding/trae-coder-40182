@@ -6,7 +6,7 @@ import re
 from typing import List, Optional
 from urllib.parse import urlparse
 
-from .schemas import Speaker, TranscriptSegment
+from .schemas import Speaker, TranscriptSegment, FailureType
 from .config import settings
 
 logger = logging.getLogger(__name__)
@@ -219,15 +219,48 @@ _FAIL_PATH_KEYWORDS = (
 
 
 class ASRError(Exception):
-    pass
+    def __init__(
+        self,
+        message: str,
+        failure_type: FailureType = FailureType.UNKNOWN,
+        failure_reason: Optional[str] = None,
+        suggest_retry: bool = True,
+    ):
+        super().__init__(message)
+        self.failure_type = failure_type
+        self.failure_reason = failure_reason or message
+        self.suggest_retry = suggest_retry
 
 
 class RecordingURLError(ASRError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        failure_reason: Optional[str] = None,
+        suggest_retry: bool = False,
+    ):
+        super().__init__(
+            message=message,
+            failure_type=FailureType.RECORDING_UNREACHABLE,
+            failure_reason=failure_reason,
+            suggest_retry=suggest_retry,
+        )
 
 
 class TranscriptionFailedError(ASRError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        failure_type: FailureType = FailureType.RECORDING_CORRUPTED,
+        failure_reason: Optional[str] = None,
+        suggest_retry: bool = False,
+    ):
+        super().__init__(
+            message=message,
+            failure_type=failure_type,
+            failure_reason=failure_reason,
+            suggest_retry=suggest_retry,
+        )
 
 
 class ASRService(ABC):
@@ -250,33 +283,49 @@ class MockASRService(ASRService):
             if kw in host_lower:
                 if kw in ("timeout", "timedout", "time-out"):
                     raise RecordingURLError(
-                        f"连接录音地址超时，无法在规定时间内建立连接: {parsed.hostname}"
+                        f"连接录音地址超时，无法在规定时间内建立连接: {parsed.hostname}",
+                        failure_reason=f"连接录音服务器超时，请检查网络连通性或稍后重试",
+                        suggest_retry=True,
                     )
                 if kw in ("404", "notfound", "not-found", "not_found"):
                     raise TranscriptionFailedError(
-                        f"录音文件不存在，HTTP 404 Not Found: {recording_url}"
+                        f"录音文件不存在，HTTP 404 Not Found: {recording_url}",
+                        failure_reason="录音文件不存在或已被删除，请核对文件地址是否正确",
+                        suggest_retry=False,
                     )
                 if kw in ("500", "502", "503", "504"):
                     raise TranscriptionFailedError(
-                        f"录音服务端返回错误 HTTP {kw}: {parsed.hostname}"
+                        f"录音服务端返回错误 HTTP {kw}: {parsed.hostname}",
+                        failure_reason=f"录音存储服务异常（HTTP {kw}，建议稍后重试",
+                        failure_type=FailureType.ASR_SERVICE_ERROR,
+                        suggest_retry=True,
                     )
                 if kw in ("unreachable", "unavailable", "nohost", "bad-host", "dns-error"):
                     raise RecordingURLError(
-                        f"无法解析录音地址主机名，DNS 解析失败: {parsed.hostname}"
+                        f"无法解析录音地址主机名，DNS 解析失败: {parsed.hostname}",
+                        failure_reason=f"录音地址域名解析失败（DNS 错误），请检查地址是否正确或联系运维",
+                        suggest_retry=False,
                     )
                 raise RecordingURLError(
-                    f"录音地址不可访问，无法连接到服务器: {parsed.hostname}"
+                    f"录音地址不可访问，无法连接到服务器: {parsed.hostname}",
+                    failure_reason=f"录音地址无法访问（主机 {parsed.hostname} 拒绝连接），请确认录音服务是否在线",
+                    suggest_retry=False,
                 )
 
         for kw in _FAIL_PATH_KEYWORDS:
             if kw in path_lower:
                 if any(ext in kw for ext in (".err", ".invalid", ".broken", ".bad", ".corrupt", ".damaged")):
                     raise TranscriptionFailedError(
-                        f"录音文件损坏或格式不支持，无法解码: {parsed.path}"
+                        f"录音文件损坏或格式不支持，无法解码: {parsed.path}",
+                        failure_reason="录音文件已损坏或格式不兼容（无法解码，请确认录音文件本身是否正常",
+                        failure_type=FailureType.RECORDING_CORRUPTED,
+                        suggest_retry=False,
                     )
                 raise TranscriptionFailedError(
-                    f"录音文件访问失败，文件不存在或已被删除: {parsed.path}"
-                )
+                    f"录音文件访问失败，文件不存在或已被删除: {parsed.path}",
+                    failure_reason="录音文件不存在或已被删除，请核对文件路径或重新上传录音",
+                    suggest_retry=False,
+                    )
 
         if _has_scenario_keyword(url_lower):
             return
@@ -290,23 +339,39 @@ class MockASRService(ASRService):
         if not host_valid:
             raise RecordingURLError(
                 f"录音地址无法访问，主机 {parsed.hostname} 连接失败: "
-                f"Connection refused (Connection refused to {parsed.hostname}:443)"
+                f"Connection refused (Connection refused to {parsed.hostname}:443)",
+                failure_reason=f"录音地址 {parsed.hostname} 无法访问（Connection refused），请确认该地址是否可被合规转写服务访问",
+                suggest_retry=False,
             )
 
     def _validate_url(self, recording_url: str) -> None:
         if not recording_url or not recording_url.strip():
-            raise RecordingURLError("录音地址不能为空")
+            raise RecordingURLError(
+                "录音地址不能为空",
+                failure_reason="录音地址为空，请重新提交正确的文件地址",
+                suggest_retry=False,
+            )
 
         parsed = urlparse(recording_url)
         if parsed.scheme not in ("http", "https"):
             raise RecordingURLError(
-                f"录音地址协议不支持: {parsed.scheme}，仅支持 http/https"
+                f"录音地址协议不支持: {parsed.scheme}，仅支持 http/https",
+                failure_reason=f"录音地址协议不支持（当前: {parsed.scheme}），仅支持 http/https 协议",
+                suggest_retry=False,
             )
         if not parsed.hostname:
-            raise RecordingURLError(f"录音地址格式无效，无法解析主机名: {recording_url}")
+            raise RecordingURLError(
+                f"录音地址格式无效，无法解析主机名: {recording_url}",
+                failure_reason="录音地址格式无效（无法解析主机名），请重新检查 URL 格式",
+                suggest_retry=False,
+            )
 
         if parsed.port and parsed.port == 0:
-            raise RecordingURLError(f"录音地址端口无效: {parsed.port}")
+            raise RecordingURLError(
+                f"录音地址端口无效: {parsed.port}",
+                failure_reason=f"录音地址端口无效（{parsed.port}），请重新检查 URL",
+                suggest_retry=False,
+            )
 
         self._check_url_reachable(recording_url)
 

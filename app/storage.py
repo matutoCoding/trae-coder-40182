@@ -1,11 +1,12 @@
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 import uuid
 
 from .schemas import (
     TaskStatus,
     CallType,
+    FailureType,
     RiskConclusion,
     CallbackStatus,
     CallbackRecord,
@@ -15,6 +16,8 @@ from .schemas import (
     TranscriptResult,
     RiskAnalysisResponse,
     TaskSummary,
+    AgentDailyStats,
+    SupervisorStatsResponse,
     RiskLevel,
 )
 
@@ -40,6 +43,9 @@ class TranscriptionTask:
         self.has_risk: bool = False
         self.callbacks: List[CallbackRecord] = []
         self.error_message: Optional[str] = None
+        self.failure_type: Optional[FailureType] = None
+        self.failure_reason: Optional[str] = None
+        self.suggest_retry: Optional[bool] = None
 
     def to_transcript_result(self) -> TranscriptResult:
         return TranscriptResult(
@@ -56,6 +62,9 @@ class TranscriptionTask:
             has_risk=self.has_risk,
             callback_url=self.callback_url,
             error_message=self.error_message,
+            failure_type=self.failure_type,
+            failure_reason=self.failure_reason,
+            suggest_retry=self.suggest_retry,
         )
 
     def to_risk_analysis_response(self) -> RiskAnalysisResponse:
@@ -84,6 +93,7 @@ class TranscriptionTask:
     def to_task_summary(self) -> TaskSummary:
         high_risk = sum(1 for r in self.risks if r.risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL))
         unhandled = sum(1 for r in self.risks if r.conclusion == RiskConclusion.UNHANDLED)
+        confirmed = sum(1 for r in self.risks if r.conclusion == RiskConclusion.CONFIRMED_VIOLATION)
         last_cb = self.callbacks[-1] if self.callbacks else None
         return TaskSummary(
             task_id=self.task_id,
@@ -98,9 +108,13 @@ class TranscriptionTask:
             risk_count=len(self.risks),
             high_risk_count=high_risk,
             unhandled_risk_count=unhandled,
+            confirmed_risk_count=confirmed,
             has_callback=bool(self.callback_url),
             last_callback_status=last_cb.status if last_cb else None,
             error_message=self.error_message,
+            failure_type=self.failure_type,
+            failure_reason=self.failure_reason,
+            suggest_retry=self.suggest_retry,
         )
 
 
@@ -135,6 +149,52 @@ class TaskStorage(ABC):
     @abstractmethod
     def get_callback_records(self, task_id: str) -> List[CallbackRecord]:
         ...
+
+    @abstractmethod
+    def aggregate_supervisor_stats(
+        self,
+        date_from: str,
+        date_to: str,
+        agent_id: Optional[str] = None,
+        call_type: Optional[CallType] = None,
+        group_by: str = "agent",
+    ) -> SupervisorStatsResponse:
+        ...
+
+
+def _task_date_key(t: TranscriptionTask) -> str:
+    return t.submitted_at.strftime("%Y-%m-%d")
+
+
+def _build_agent_stat(
+    agent_id: str,
+    date_str: str,
+    tasks: List[TranscriptionTask],
+    call_type: Optional[CallType] = None,
+) -> AgentDailyStats:
+    total = len(tasks)
+    failed = sum(1 for t in tasks if t.status == TaskStatus.FAILED)
+    with_risk = sum(1 for t in tasks if t.has_risk)
+    total_risks = sum(len(t.risks) for t in tasks)
+    confirmed = sum(
+        1 for t in tasks for r in t.risks if r.conclusion == RiskConclusion.CONFIRMED_VIOLATION
+    )
+    unhandled = sum(
+        1 for t in tasks for r in t.risks if r.conclusion == RiskConclusion.UNHANDLED
+    )
+    return AgentDailyStats(
+        agent_id=agent_id,
+        call_type=call_type,
+        date=date_str,
+        total_tasks=total,
+        failed_tasks=failed,
+        failed_rate=round(failed / total, 4) if total else 0.0,
+        tasks_with_risk=with_risk,
+        risk_rate=round(with_risk / total, 4) if total else 0.0,
+        total_risks=total_risks,
+        confirmed_violations=confirmed,
+        unhandled_risks=unhandled,
+    )
 
 
 class InMemoryTaskStorage(TaskStorage):
@@ -184,6 +244,64 @@ class InMemoryTaskStorage(TaskStorage):
         if not task:
             return []
         return sorted(task.callbacks, key=lambda r: r.sent_at or r.completed_at or datetime.min, reverse=True)
+
+    def aggregate_supervisor_stats(
+        self,
+        date_from: str,
+        date_to: str,
+        agent_id: Optional[str] = None,
+        call_type: Optional[CallType] = None,
+        group_by: str = "agent",
+    ) -> SupervisorStatsResponse:
+        try:
+            dt_from = datetime.strptime(date_from, "%Y-%m-%d")
+        except ValueError:
+            dt_from = datetime.min
+        try:
+            dt_to = datetime.strptime(date_to, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+        except ValueError:
+            dt_to = datetime.max
+
+        all_tasks = list(self._tasks.values())
+        filtered = [
+            t for t in all_tasks
+            if t.submitted_at >= dt_from and t.submitted_at <= dt_to
+            and (agent_id is None or t.agent_id == agent_id)
+            and (call_type is None or t.call_type == call_type)
+        ]
+
+        total_tasks = len(filtered)
+        total_failed = sum(1 for t in filtered if t.status == TaskStatus.FAILED)
+        total_risks = sum(len(t.risks) for t in filtered)
+        total_confirmed = sum(
+            1 for t in filtered for r in t.risks if r.conclusion == RiskConclusion.CONFIRMED_VIOLATION
+        )
+
+        groups: Dict[Tuple[str, str, Optional[CallType]], List[TranscriptionTask]] = {}
+        for t in filtered:
+            d = _task_date_key(t)
+            if group_by == "agent_call_type":
+                key = (t.agent_id, d, t.call_type)
+            else:
+                key = (t.agent_id, d, None)
+            groups.setdefault(key, []).append(t)
+
+        items: List[AgentDailyStats] = []
+        for (aid, d, ct), ts in sorted(groups.items()):
+            items.append(_build_agent_stat(aid, d, ts, ct))
+
+        items.sort(key=lambda s: (-s.total_tasks, s.agent_id, s.date))
+
+        return SupervisorStatsResponse(
+            date_from=date_from,
+            date_to=date_to,
+            group_by=group_by,
+            total_tasks=total_tasks,
+            total_failed=total_failed,
+            total_risks=total_risks,
+            total_confirmed=total_confirmed,
+            items=items,
+        )
 
 
 _storage_instance: Optional[TaskStorage] = None

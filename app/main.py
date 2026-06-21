@@ -18,6 +18,8 @@ from .schemas import (
     RiskAnalysisResponse,
     RiskConclusionUpdateRequest,
     CallbackListResponse,
+    CallbackRetryRequest,
+    SupervisorStatsResponse,
     TaskListResponse,
 )
 from .task_processor import get_task_processor
@@ -33,13 +35,15 @@ app = FastAPI(
     version=settings.app_version,
     description=(
         "面向呼叫中心合规岗的后端转写与预警服务。\n\n"
-        "提供以下核心接口：\n"
+        "核心接口：\n"
         "1. **POST /api/v1/tasks** - 提交录音转写任务（支持回调URL、自定义文本）\n"
-        "2. **GET /api/v1/tasks** - 任务列表（按坐席/状态/通话类型/时间范围过滤）\n"
-        "3. **GET /api/v1/tasks/{task_id}** - 查询转写状态及获取对话文本\n"
-        "4. **GET /api/v1/tasks/{task_id}/risks** - 获取风险检测结果（按结论/等级/类别筛选）\n"
-        "5. **POST /api/v1/tasks/{task_id}/risks/{segment_index}/conclusion** - 更新风险处理结论\n"
-        "6. **GET /api/v1/tasks/{task_id}/callbacks** - 查询回调历史"
+        "2. **GET /api/v1/tasks** - 任务列表（按坐席/状态/通话类型/时间范围过滤，返回失败分类）\n"
+        "3. **GET /api/v1/tasks/{task_id}** - 查询转写状态（含失败类型/可读原因/是否建议重试）\n"
+        "4. **GET /api/v1/tasks/{task_id}/risks** - 风险检测结果（每条风险独立 risk_id，按结论筛选）\n"
+        "5. **POST /api/v1/tasks/{task_id}/risks/{risk_id}/conclusion** - 按 risk_id 更新风险处理结论\n"
+        "6. **GET /api/v1/tasks/{task_id}/callbacks** - 查询回调历史（含真实 HTTP 状态码和失败原因）\n"
+        "7. **POST /api/v1/tasks/{task_id}/callbacks/retry** - 手动重试回调\n"
+        "8. **GET /api/v1/stats/supervisor** - 主管统计（按坐席/通话类型/日期范围汇总任务、失败、风险、确认违规）"
     ),
 )
 
@@ -73,8 +77,8 @@ async def health_check():
         "- `call_id`（可选）: 业务系统通话ID\n"
         "- `customer_id`（可选）: 客户编号\n"
         "- `mock_text`（可选）: 联调用自定义转写文本（按句号切句，坐席/客户轮流）\n"
-        "- `callback_url`（可选）: 任务完成/失败后接收状态推送的回调地址\n\n"
-        "**返回**：任务ID和当前状态，任务会在后台异步执行转写和风险检测。"
+        "- `callback_url`（可选）: 任务完成/失败后接收状态推送的回调地址（真实 HTTP POST）\n\n"
+        "任务会在后台异步执行转写和风险检测，完成后若配置了 callback_url 会主动推送。"
     ),
 )
 async def submit_recording(request: RecordingSubmitRequest):
@@ -92,17 +96,14 @@ async def submit_recording(request: RecordingSubmitRequest):
     "/api/v1/tasks",
     response_model=TaskListResponse,
     tags=["Tasks"],
-    summary="查询任务列表",
+    summary="查询任务列表（含失败分类、可读原因、建议重试）",
     description=(
         "按坐席、状态、通话类型、提交时间范围查询任务列表，支持分页。\n\n"
-        "**筛选参数**：\n"
-        "- `agent_id`（可选）: 按坐席编号筛选\n"
-        "- `status`（可选）: 按任务状态筛选（pending/transcribing/analyzing/completed/failed）\n"
-        "- `call_type`（可选）: 按通话类型筛选（outbound/inbound/callback）\n"
-        "- `submitted_after`（可选）: 提交时间 >= 该值（ISO 8601，如 2024-01-01T00:00:00）\n"
-        "- `submitted_before`（可选）: 提交时间 <= 该值（ISO 8601）\n"
-        "- `page`: 页码，默认 1\n"
-        "- `page_size`: 每页数量，默认 20"
+        "每条任务摘要会带出：\n"
+        "- `failure_type`: recording_unreachable/recording_corrupted/asr_service_error/analysis_error/unknown\n"
+        "- `failure_reason`: 面向合规岗的可读失败原因（列表页直接可见）\n"
+        "- `suggest_retry`: 是否建议重试\n"
+        "- `confirmed_risk_count`: 已确认违规数量"
     ),
 )
 async def list_tasks(
@@ -132,14 +133,13 @@ async def list_tasks(
     tags=["Tasks"],
     summary="查询转写状态与对话文本",
     description=(
-        "合规岗后台按任务号查询转写进度和结果。\n\n"
-        "**状态流转**：`pending` → `transcribing` → `analyzing` → `completed`\n\n"
-        "当状态为 `completed` 时，`segments` 字段包含带时间戳的完整对话文本。\n"
-        "若任务配了 `callback_url`，可通过 `/callbacks` 接口查看回调历史。"
+        "按任务号查询转写进度和结果。\n\n"
+        "任务失败时除了 `error_message`（内部详细）外，额外返回：\n"
+        "- `failure_type`: 失败分类枚举\n"
+        "- `failure_reason`: 面向合规岗的可读失败原因\n"
+        "- `suggest_retry`: 是否建议重试（地址/文件问题不建议重试，服务异常建议重试）"
     ),
-    responses={
-        404: {"description": "任务不存在"},
-    },
+    responses={404: {"description": "任务不存在"}},
 )
 async def get_task_status(task_id: str):
     processor = get_task_processor()
@@ -153,23 +153,13 @@ async def get_task_status(task_id: str):
     "/api/v1/tasks/{task_id}/risks",
     response_model=RiskAnalysisResponse,
     tags=["Risk & Compliance"],
-    summary="获取风险检测结果",
+    summary="获取风险检测结果（每条风险独立 risk_id）",
     description=(
-        "获取通话中的合规风险片段列表，支持按风险等级、类别、说话人、处理结论筛选。\n\n"
-        "每个风险片段包含：\n"
-        "- `original_text`: 原句内容\n"
-        "- `speaker`: 说话人（agent/customer）\n"
-        "- `start_time` / `end_time`: 起止时间（秒）\n"
-        "- `risk_category`: 风险类别\n"
-        "- `risk_level`: 建议风险等级（low/medium/high/critical）\n"
-        "- `suggestion`: 合规处理建议\n"
-        "- `conclusion`: 处理结论（unhandled/confirmed_violation/false_alarm/reviewed_no_issue/pending_review）\n"
-        "- `reviewer` / `reviewed_at` / `review_note`: 复核信息\n\n"
-        "业务系统可将高风险通话自动推入人工复核队列。"
+        "获取通话中的合规风险片段列表。\n\n"
+        "**每条风险都有独立 risk_id**，同一句话（同一 segment）如果同时触发多类风险（例如既加微信又保证收益），会返回多条风险片段并可以分别打处理结论。\n\n"
+        "支持按 risk_level / risk_category / speaker / conclusion 多维筛选。"
     ),
-    responses={
-        404: {"description": "任务不存在"},
-    },
+    responses={404: {"description": "任务不存在"}},
 )
 async def get_task_risks(
     task_id: str,
@@ -192,38 +182,35 @@ async def get_task_risks(
 
 
 @app.post(
-    "/api/v1/tasks/{task_id}/risks/{segment_index}/conclusion",
+    "/api/v1/tasks/{task_id}/risks/{risk_id}/conclusion",
     response_model=RiskAnalysisResponse,
     tags=["Risk & Compliance"],
-    summary="更新风险处理结论",
+    summary="按 risk_id 更新风险处理结论",
     description=(
-        "合规岗对某条风险片段打处理结论，形成人工质检闭环。\n\n"
-        "**处理结论（conclusion）可选值**：\n"
-        "- `unhandled`: 未处理（初始状态）\n"
+        "合规岗对某条风险片段（通过独立 risk_id 定位）打处理结论，形成人工质检闭环。\n\n"
+        "同一句话同时命中多类风险时，分别有不同的 risk_id，可分别打不同结论（如一个确认违规，另一个误报）。\n\n"
+        "**处理结论可选值**：\n"
+        "- `unhandled`: 未处理\n"
         "- `confirmed_violation`: 确认违规\n"
         "- `false_alarm`: 误报\n"
         "- `reviewed_no_issue`: 已复核无问题\n"
-        "- `pending_review`: 待进一步复核\n\n"
-        "**路径参数**：\n"
-        "- `task_id`: 任务ID\n"
-        "- `segment_index`: 风险片段的 segment_index（与风险列表返回值一致）\n\n"
-        "成功返回更新后的完整风险分析结果。"
+        "- `pending_review`: 待进一步复核"
     ),
     responses={
-        404: {"description": "任务不存在，或风险片段不存在"},
+        404: {"description": "任务不存在，或 risk_id 不存在"},
         409: {"description": "任务尚未完成，无法处理"},
     },
 )
 async def update_risk_conclusion(
     task_id: str,
-    segment_index: int,
+    risk_id: str,
     update: RiskConclusionUpdateRequest,
 ):
     processor = get_task_processor()
-    ok, err, result = processor.update_risk_conclusion(task_id, segment_index, update)
+    ok, err, result = processor.update_risk_conclusion_by_risk_id(task_id, risk_id, update)
     if not ok and f"任务 {task_id} 不存在" in (err or ""):
         raise HTTPException(status_code=404, detail=err)
-    if not ok and "未找到 segment_index" in (err or ""):
+    if not ok and "未找到 risk_id" in (err or ""):
         raise HTTPException(status_code=404, detail=err)
     if not ok:
         raise HTTPException(status_code=409, detail=err)
@@ -236,16 +223,14 @@ async def update_risk_conclusion(
     tags=["Callbacks"],
     summary="查询回调历史",
     description=(
-        "查询某个任务的回调推送历史，用于排查客服平台是否成功接收了任务状态。\n\n"
-        "**返回内容**：\n"
-        "- `total`: 总回调次数\n"
-        "- `success_count`: 成功次数\n"
-        "- `failed_count`: 失败次数\n"
-        "- `items`: 每次回调的详细记录（时间、耗时、HTTP状态码、错误原因、响应片段）"
+        "查询某个任务的所有回调推送历史，用于排查客服平台是否成功接收。\n\n"
+        "每条回调记录包含：\n"
+        "- `triggered_by`: auto（自动触发）/ manual（手动重试）\n"
+        "- `http_status_code`: 对方返回的真实 HTTP 状态码（4xx/5xx/2xx 等）\n"
+        "- `error_message`: 真实失败原因（超时、连接被拒绝、HTTP 500 等）\n"
+        "- `response_body`: 对方响应体（截断前 500 字符）"
     ),
-    responses={
-        404: {"description": "任务不存在"},
-    },
+    responses={404: {"description": "任务不存在"}},
 )
 async def get_callback_history(task_id: str):
     processor = get_task_processor()
@@ -253,6 +238,71 @@ async def get_callback_history(task_id: str):
     if result is None:
         raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
     return result
+
+
+@app.post(
+    "/api/v1/tasks/{task_id}/callbacks/retry",
+    response_model=CallbackListResponse,
+    tags=["Callbacks"],
+    summary="手动重试回调",
+    description=(
+        "手动触发该任务的回调推送（仅尝试 1 次），用于客服平台修复后手动补推。\n\n"
+        "请求体可选传 `reviewer` 记录操作人。\n\n"
+        "返回更新后的回调历史，可查看最新一次手动重试是否成功。"
+    ),
+    responses={
+        404: {"description": "任务不存在"},
+        400: {"description": "任务未配置回调地址，或任务尚未结束"},
+    },
+)
+async def retry_callback(
+    task_id: str,
+    request: Optional[CallbackRetryRequest] = None,
+):
+    processor = get_task_processor()
+    reviewer = request.reviewer if request else None
+    ok, err, result = processor.retry_callback(task_id, reviewer=reviewer)
+    if not ok and f"任务 {task_id} 不存在" in (err or ""):
+        raise HTTPException(status_code=404, detail=err)
+    if not ok:
+        raise HTTPException(status_code=400, detail=err)
+    return result
+
+
+@app.get(
+    "/api/v1/stats/supervisor",
+    response_model=SupervisorStatsResponse,
+    tags=["Statistics"],
+    summary="主管统计：坐席维度日汇总",
+    description=(
+        "面向主管的每日收工统计，按坐席（或坐席+通话类型）+ 日期聚合。\n\n"
+        "每个分组返回：\n"
+        "- `total_tasks`: 任务总量\n"
+        "- `failed_tasks` / `failed_rate`: 失败量与失败率\n"
+        "- `tasks_with_risk` / `risk_rate`: 有风险任务量与风险率\n"
+        "- `total_risks`: 风险片段总数\n"
+        "- `confirmed_violations`: 已确认违规数量\n"
+        "- `unhandled_risks`: 未处理风险数量\n\n"
+        "顶部还有全量汇总（total_tasks/total_failed/total_risks/total_confirmed）。"
+    ),
+)
+async def supervisor_stats(
+    date_from: str = Query(..., description="统计起始日期 YYYY-MM-DD（含）"),
+    date_to: str = Query(..., description="统计结束日期 YYYY-MM-DD（含）"),
+    agent_id: Optional[str] = Query(None, description="坐席编号（可选，不填则全部坐席）"),
+    call_type: Optional[CallType] = Query(None, description="通话类型（可选）"),
+    group_by: str = Query("agent", description="聚合维度：agent（按坐席+日期）或 agent_call_type（按坐席+通话类型+日期）"),
+):
+    if group_by not in ("agent", "agent_call_type"):
+        raise HTTPException(status_code=400, detail="group_by 仅支持 agent 或 agent_call_type")
+    processor = get_task_processor()
+    return processor.supervisor_stats(
+        date_from=date_from,
+        date_to=date_to,
+        agent_id=agent_id,
+        call_type=call_type,
+        group_by=group_by,
+    )
 
 
 @app.exception_handler(Exception)
