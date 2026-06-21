@@ -6,6 +6,9 @@ import uuid
 from .schemas import (
     TaskStatus,
     CallType,
+    RiskConclusion,
+    CallbackStatus,
+    CallbackRecord,
     TranscriptSegment,
     RiskFragment,
     RecordingSubmitRequest,
@@ -27,6 +30,7 @@ class TranscriptionTask:
         self.customer_id: Optional[str] = request.customer_id
         self.call_start_time: Optional[datetime] = request.call_start_time
         self.mock_text: Optional[str] = request.mock_text
+        self.callback_url: Optional[str] = request.callback_url
         self.submitted_at: datetime = datetime.now()
         self.started_at: Optional[datetime] = None
         self.completed_at: Optional[datetime] = None
@@ -34,6 +38,7 @@ class TranscriptionTask:
         self.segments: List[TranscriptSegment] = []
         self.risks: List[RiskFragment] = []
         self.has_risk: bool = False
+        self.callbacks: List[CallbackRecord] = []
         self.error_message: Optional[str] = None
 
     def to_transcript_result(self) -> TranscriptResult:
@@ -49,6 +54,7 @@ class TranscriptionTask:
             duration_seconds=self.duration_seconds,
             segments=self.segments,
             has_risk=self.has_risk,
+            callback_url=self.callback_url,
             error_message=self.error_message,
         )
 
@@ -56,6 +62,10 @@ class TranscriptionTask:
         high = sum(1 for r in self.risks if r.risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL))
         medium = sum(1 for r in self.risks if r.risk_level == RiskLevel.MEDIUM)
         low = sum(1 for r in self.risks if r.risk_level == RiskLevel.LOW)
+        unhandled = sum(1 for r in self.risks if r.conclusion == RiskConclusion.UNHANDLED)
+        confirmed = sum(1 for r in self.risks if r.conclusion == RiskConclusion.CONFIRMED_VIOLATION)
+        false_alarm = sum(1 for r in self.risks if r.conclusion == RiskConclusion.FALSE_ALARM)
+        reviewed = sum(1 for r in self.risks if r.conclusion in (RiskConclusion.REVIEWED_NO_ISSUE, RiskConclusion.PENDING_REVIEW))
         return RiskAnalysisResponse(
             task_id=self.task_id,
             status=self.status,
@@ -64,11 +74,17 @@ class TranscriptionTask:
             high_risk_count=high,
             medium_risk_count=medium,
             low_risk_count=low,
+            unhandled_count=unhandled,
+            confirmed_count=confirmed,
+            false_alarm_count=false_alarm,
+            reviewed_count=reviewed,
             risks=self.risks,
         )
 
     def to_task_summary(self) -> TaskSummary:
         high_risk = sum(1 for r in self.risks if r.risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL))
+        unhandled = sum(1 for r in self.risks if r.conclusion == RiskConclusion.UNHANDLED)
+        last_cb = self.callbacks[-1] if self.callbacks else None
         return TaskSummary(
             task_id=self.task_id,
             status=self.status,
@@ -81,6 +97,9 @@ class TranscriptionTask:
             has_risk=self.has_risk,
             risk_count=len(self.risks),
             high_risk_count=high_risk,
+            unhandled_risk_count=unhandled,
+            has_callback=bool(self.callback_url),
+            last_callback_status=last_cb.status if last_cb else None,
             error_message=self.error_message,
         )
 
@@ -99,7 +118,22 @@ class TaskStorage(ABC):
         ...
 
     @abstractmethod
-    def list_tasks(self, agent_id: Optional[str] = None, status: Optional[TaskStatus] = None) -> List[TranscriptionTask]:
+    def list_tasks(
+        self,
+        agent_id: Optional[str] = None,
+        status: Optional[TaskStatus] = None,
+        call_type: Optional[CallType] = None,
+        submitted_after: Optional[datetime] = None,
+        submitted_before: Optional[datetime] = None,
+    ) -> List[TranscriptionTask]:
+        ...
+
+    @abstractmethod
+    def add_callback_record(self, task_id: str, record: CallbackRecord) -> None:
+        ...
+
+    @abstractmethod
+    def get_callback_records(self, task_id: str) -> List[CallbackRecord]:
         ...
 
 
@@ -119,13 +153,37 @@ class InMemoryTaskStorage(TaskStorage):
         if task.task_id in self._tasks:
             self._tasks[task.task_id] = task
 
-    def list_tasks(self, agent_id: Optional[str] = None, status: Optional[TaskStatus] = None) -> List[TranscriptionTask]:
+    def list_tasks(
+        self,
+        agent_id: Optional[str] = None,
+        status: Optional[TaskStatus] = None,
+        call_type: Optional[CallType] = None,
+        submitted_after: Optional[datetime] = None,
+        submitted_before: Optional[datetime] = None,
+    ) -> List[TranscriptionTask]:
         tasks = list(self._tasks.values())
         if agent_id:
             tasks = [t for t in tasks if t.agent_id == agent_id]
         if status:
             tasks = [t for t in tasks if t.status == status]
+        if call_type:
+            tasks = [t for t in tasks if t.call_type == call_type]
+        if submitted_after:
+            tasks = [t for t in tasks if t.submitted_at >= submitted_after]
+        if submitted_before:
+            tasks = [t for t in tasks if t.submitted_at <= submitted_before]
         return sorted(tasks, key=lambda t: t.submitted_at, reverse=True)
+
+    def add_callback_record(self, task_id: str, record: CallbackRecord) -> None:
+        task = self._tasks.get(task_id)
+        if task:
+            task.callbacks.append(record)
+
+    def get_callback_records(self, task_id: str) -> List[CallbackRecord]:
+        task = self._tasks.get(task_id)
+        if not task:
+            return []
+        return sorted(task.callbacks, key=lambda r: r.sent_at or r.completed_at or datetime.min, reverse=True)
 
 
 _storage_instance: Optional[TaskStorage] = None

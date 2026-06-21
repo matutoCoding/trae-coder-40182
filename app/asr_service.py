@@ -100,30 +100,44 @@ SCENARIO_MAP = {
     "all_risks": MOCK_TRANSCRIPTS_ALL_RISKS,
 }
 
+SCENARIO_KEYWORDS_MAP = [
+    (("allrisk", "all_risk", "all-risk"), MOCK_TRANSCRIPTS_ALL_RISKS),
+    (("wechat", "weixin", "wx", "微信"), MOCK_TRANSCRIPTS_WECHAT),
+    (("profit", "guarantee", "收益", "保本"), MOCK_TRANSCRIPTS_PROFIT),
+    (("abuse", "辱骂", "脏话"), MOCK_TRANSCRIPTS_ABUSE),
+    (("no_notice", "nonotice", "no-notice", "无告知"), MOCK_TRANSCRIPTS_NO_NOTICE),
+    (("normal", "safe", "合规", "安全"), MOCK_TRANSCRIPTS_NORMAL),
+]
+
+MOCK_VALID_DOMAINS = (
+    "example.com", "example.org", "example.net",
+    "mock-server", "mock.recording", "mockrecord",
+    "test-cdn", "test-recording", "testrecord",
+    "demo-call", "democall", "demo-cdn",
+    "cfsim", "compliance-sim", "localhost",
+    "127.0.0.1", "oss-", "cdn-", "storage-",
+    "cos.", "obs.", "oss.", "qiniu", "aliyuncs",
+    "myqcloud", "bcebos", "huaweicloud",
+)
+
 SCENARIO_NAMES = list(SCENARIO_MAP.keys())
+
+
+def _has_scenario_keyword(url_lower: str) -> bool:
+    for keywords, _ in SCENARIO_KEYWORDS_MAP:
+        for kw in keywords:
+            if kw in url_lower:
+                return True
+    return False
 
 
 def _select_scenario_by_url(recording_url: str) -> list:
     url_lower = recording_url.lower()
 
-    for keyword in ("allrisk", "all_risk", "all-risk"):
-        if keyword in url_lower:
-            return MOCK_TRANSCRIPTS_ALL_RISKS
-    for keyword in ("wechat", "weixin", "wx", "微信"):
-        if keyword in url_lower:
-            return MOCK_TRANSCRIPTS_WECHAT
-    for keyword in ("profit", "guarantee", "收益", "保本"):
-        if keyword in url_lower:
-            return MOCK_TRANSCRIPTS_PROFIT
-    for keyword in ("abuse", "辱骂", "脏话"):
-        if keyword in url_lower:
-            return MOCK_TRANSCRIPTS_ABUSE
-    for keyword in ("no_notice", "nonotice", "no-notice", "无告知"):
-        if keyword in url_lower:
-            return MOCK_TRANSCRIPTS_NO_NOTICE
-    for keyword in ("normal", "safe", "合规", "安全"):
-        if keyword in url_lower:
-            return MOCK_TRANSCRIPTS_NORMAL
+    for keywords, scenario in SCENARIO_KEYWORDS_MAP:
+        for kw in keywords:
+            if kw in url_lower:
+                return scenario
 
     url_hash = int(hashlib.md5(recording_url.encode()).hexdigest(), 16)
     idx = url_hash % len(SCENARIO_NAMES)
@@ -230,6 +244,7 @@ class MockASRService(ASRService):
         parsed = urlparse(recording_url)
         host_lower = (parsed.hostname or "").lower()
         path_lower = parsed.path.lower()
+        url_lower = recording_url.lower()
 
         for kw in _FAIL_HOST_KEYWORDS:
             if kw in host_lower:
@@ -255,13 +270,28 @@ class MockASRService(ASRService):
 
         for kw in _FAIL_PATH_KEYWORDS:
             if kw in path_lower:
-                if ".err" in kw or ".invalid" in kw or ".broken" in kw or ".bad" in kw:
+                if any(ext in kw for ext in (".err", ".invalid", ".broken", ".bad", ".corrupt", ".damaged")):
                     raise TranscriptionFailedError(
                         f"录音文件损坏或格式不支持，无法解码: {parsed.path}"
                     )
                 raise TranscriptionFailedError(
                     f"录音文件访问失败，文件不存在或已被删除: {parsed.path}"
                 )
+
+        if _has_scenario_keyword(url_lower):
+            return
+
+        host_valid = False
+        for allowed in MOCK_VALID_DOMAINS:
+            if host_lower == allowed or host_lower.endswith("." + allowed) or allowed in host_lower:
+                host_valid = True
+                break
+
+        if not host_valid:
+            raise RecordingURLError(
+                f"录音地址无法访问，主机 {parsed.hostname} 连接失败: "
+                f"Connection refused (Connection refused to {parsed.hostname}:443)"
+            )
 
     def _validate_url(self, recording_url: str) -> None:
         if not recording_url or not recording_url.strip():
