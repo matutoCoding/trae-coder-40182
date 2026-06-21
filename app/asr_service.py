@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 import asyncio
 import hashlib
 import logging
+import re
 from typing import List, Optional
 from urllib.parse import urlparse
 
@@ -81,15 +82,16 @@ MOCK_TRANSCRIPTS_ALL_RISKS = [
     (Speaker.AGENT, "赵先生，我们最近有一款非常不错的私募基金产品，预期年化收益20%以上，我保证本金绝对安全，稳赚不赔。"),
     (Speaker.CUSTOMER, "真的假的？不会亏吧？"),
     (Speaker.AGENT, "赵先生您放心，我保证收益不低于15%，零风险的，您买了肯定赚。"),
-    (Speaker.CUSTOMER, "那行吧，不过你们这个怎么操作？"),
-    (Speaker.AGENT, "您加我微信吧，微信号是zhaolegun888，我把合同和资料发给您看，后续微信联系我就行。"),
-    (Speaker.CUSTOMER, "好，我加一下。不过说实话你们这服务态度之前不太行啊。"),
-    (Speaker.AGENT, "您说之前谁接待您的？我去看一下。"),
-    (Speaker.CUSTOMER, "就你们那个小刘，说好三天给回复，等了一个礼拜都没消息，傻逼玩意儿！"),
-    (Speaker.AGENT, "非常抱歉给您带来不便，我这边立即核实处理，感谢您的反馈。"),
+    (Speaker.CUSTOMER, "那行吧，不过你们这服务态度也太差了，上次那个客服半天不回话。"),
+    (Speaker.AGENT, "您说什么呢？我们服务怎么了？你他妈是不是没事找事啊？"),
+    (Speaker.CUSTOMER, "你怎么说话呢？还骂人啊？"),
+    (Speaker.AGENT, "骂你怎么了？傻逼玩意儿，爱买不买，滚蛋！"),
+    (Speaker.CUSTOMER, "行，我要投诉你！"),
+    (Speaker.AGENT, "您加我微信吧，微信号是licai888vip，有啥问题微信上跟我说，我给您单独处理。"),
+    (Speaker.CUSTOMER, "我才不加，我要找你们领导。"),
 ]
 
-SCENARIO_MAP: dict[str, list] = {
+SCENARIO_MAP = {
     "normal": MOCK_TRANSCRIPTS_NORMAL,
     "wechat": MOCK_TRANSCRIPTS_WECHAT,
     "profit": MOCK_TRANSCRIPTS_PROFIT,
@@ -143,6 +145,65 @@ def _compute_timestamps(scenario: list) -> List[TranscriptSegment]:
     return segments
 
 
+_SENTENCE_SPLIT_RE = re.compile(r"([。！？!?；;])")
+
+
+def parse_mock_text(text: str) -> List[TranscriptSegment]:
+    if not text or not text.strip():
+        return []
+
+    pieces = _SENTENCE_SPLIT_RE.split(text.strip())
+    sentences: list[str] = []
+    buffer = ""
+    for piece in pieces:
+        if piece in "。！？!?；;":
+            buffer += piece
+            if buffer.strip():
+                sentences.append(buffer.strip())
+            buffer = ""
+        else:
+            buffer += piece
+    if buffer.strip():
+        sentences.append(buffer.strip())
+
+    segments: List[TranscriptSegment] = []
+    current_time = 0.0
+    for i, sentence in enumerate(sentences):
+        speaker = Speaker.AGENT if i % 2 == 0 else Speaker.CUSTOMER
+        duration = round(max(1.2, len(sentence) * 0.22 + 0.5), 2)
+        segments.append(TranscriptSegment(
+            start_time=round(current_time, 2),
+            end_time=round(current_time + duration, 2),
+            speaker=speaker,
+            text=sentence,
+        ))
+        current_time += duration + 0.25
+    return segments
+
+
+_FAIL_HOST_KEYWORDS = (
+    "dns-error", "invalid-host", "bad-host",
+    "not-found", "not_found", "notfound",
+    "timed-out", "timedout", "time-out",
+    "unreachable", "unavailable",
+    "timeout", "offline", "down", "dead",
+    "broken", "failure", "failed", "faild",
+    "invalid", "nohost", "noserver",
+    "error", "err", "fail",
+    "404", "500", "502", "503", "504",
+    "0.0.0.0",
+)
+
+_FAIL_PATH_KEYWORDS = (
+    "/fail/", "/error/", "/404/", "/500/",
+    "/broken/", "/invalid/", "/notfound/",
+    "/fail_", "/error_", "/broken_",
+    "fail-", "broken-",
+    ".err", ".invalid", ".broken", ".bad",
+    ".corrupt", ".damaged", ".missing",
+)
+
+
 class ASRError(Exception):
     pass
 
@@ -157,13 +218,50 @@ class TranscriptionFailedError(ASRError):
 
 class ASRService(ABC):
     @abstractmethod
-    async def transcribe(self, recording_url: str) -> List[TranscriptSegment]:
+    async def transcribe(self, recording_url: str, mock_text: Optional[str] = None) -> List[TranscriptSegment]:
         ...
 
 
 class MockASRService(ASRService):
     def __init__(self):
         self.delay_seconds = settings.asr_mock_delay_seconds
+
+    def _check_url_reachable(self, recording_url: str) -> None:
+        parsed = urlparse(recording_url)
+        host_lower = (parsed.hostname or "").lower()
+        path_lower = parsed.path.lower()
+
+        for kw in _FAIL_HOST_KEYWORDS:
+            if kw in host_lower:
+                if kw in ("timeout", "timedout", "time-out"):
+                    raise RecordingURLError(
+                        f"连接录音地址超时，无法在规定时间内建立连接: {parsed.hostname}"
+                    )
+                if kw in ("404", "notfound", "not-found", "not_found"):
+                    raise TranscriptionFailedError(
+                        f"录音文件不存在，HTTP 404 Not Found: {recording_url}"
+                    )
+                if kw in ("500", "502", "503", "504"):
+                    raise TranscriptionFailedError(
+                        f"录音服务端返回错误 HTTP {kw}: {parsed.hostname}"
+                    )
+                if kw in ("unreachable", "unavailable", "nohost", "bad-host", "dns-error"):
+                    raise RecordingURLError(
+                        f"无法解析录音地址主机名，DNS 解析失败: {parsed.hostname}"
+                    )
+                raise RecordingURLError(
+                    f"录音地址不可访问，无法连接到服务器: {parsed.hostname}"
+                )
+
+        for kw in _FAIL_PATH_KEYWORDS:
+            if kw in path_lower:
+                if ".err" in kw or ".invalid" in kw or ".broken" in kw or ".bad" in kw:
+                    raise TranscriptionFailedError(
+                        f"录音文件损坏或格式不支持，无法解码: {parsed.path}"
+                    )
+                raise TranscriptionFailedError(
+                    f"录音文件访问失败，文件不存在或已被删除: {parsed.path}"
+                )
 
     def _validate_url(self, recording_url: str) -> None:
         if not recording_url or not recording_url.strip():
@@ -177,24 +275,16 @@ class MockASRService(ASRService):
         if not parsed.hostname:
             raise RecordingURLError(f"录音地址格式无效，无法解析主机名: {recording_url}")
 
-        host_lower = parsed.hostname.lower()
-        if host_lower in ("invalid", "unreachable", "notfound", "0.0.0.0"):
-            raise RecordingURLError(
-                f"录音地址不可访问，无法连接主机: {parsed.hostname}"
-            )
-
         if parsed.port and parsed.port == 0:
-            raise RecordingURLError(
-                f"录音地址端口无效: {parsed.port}"
-            )
+            raise RecordingURLError(f"录音地址端口无效: {parsed.port}")
 
-        path_lower = parsed.path.lower()
-        if path_lower.endswith(".err") or path_lower.endswith(".invalid"):
-            raise TranscriptionFailedError(
-                f"录音文件格式不支持或文件损坏: {parsed.path}"
-            )
+        self._check_url_reachable(recording_url)
 
-    async def transcribe(self, recording_url: str) -> List[TranscriptSegment]:
+    async def transcribe(self, recording_url: str, mock_text: Optional[str] = None) -> List[TranscriptSegment]:
+        if mock_text and mock_text.strip():
+            await asyncio.sleep(max(0.3, self.delay_seconds * 0.3))
+            return parse_mock_text(mock_text)
+
         self._validate_url(recording_url)
 
         await asyncio.sleep(self.delay_seconds)

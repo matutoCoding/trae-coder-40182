@@ -11,6 +11,8 @@ from .schemas import (
     RecordingSubmitRequest,
     TranscriptResult,
     RiskAnalysisResponse,
+    TaskSummary,
+    RiskLevel,
 )
 
 
@@ -24,6 +26,7 @@ class TranscriptionTask:
         self.call_id: Optional[str] = request.call_id
         self.customer_id: Optional[str] = request.customer_id
         self.call_start_time: Optional[datetime] = request.call_start_time
+        self.mock_text: Optional[str] = request.mock_text
         self.submitted_at: datetime = datetime.now()
         self.started_at: Optional[datetime] = None
         self.completed_at: Optional[datetime] = None
@@ -50,9 +53,9 @@ class TranscriptionTask:
         )
 
     def to_risk_analysis_response(self) -> RiskAnalysisResponse:
-        high = sum(1 for r in self.risks if r.risk_level in ("high", "critical"))
-        medium = sum(1 for r in self.risks if r.risk_level == "medium")
-        low = sum(1 for r in self.risks if r.risk_level == "low")
+        high = sum(1 for r in self.risks if r.risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL))
+        medium = sum(1 for r in self.risks if r.risk_level == RiskLevel.MEDIUM)
+        low = sum(1 for r in self.risks if r.risk_level == RiskLevel.LOW)
         return RiskAnalysisResponse(
             task_id=self.task_id,
             status=self.status,
@@ -62,6 +65,23 @@ class TranscriptionTask:
             medium_risk_count=medium,
             low_risk_count=low,
             risks=self.risks,
+        )
+
+    def to_task_summary(self) -> TaskSummary:
+        high_risk = sum(1 for r in self.risks if r.risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL))
+        return TaskSummary(
+            task_id=self.task_id,
+            status=self.status,
+            agent_id=self.agent_id,
+            call_type=self.call_type,
+            call_id=self.call_id,
+            submitted_at=self.submitted_at,
+            completed_at=self.completed_at,
+            duration_seconds=self.duration_seconds,
+            has_risk=self.has_risk,
+            risk_count=len(self.risks),
+            high_risk_count=high_risk,
+            error_message=self.error_message,
         )
 
 

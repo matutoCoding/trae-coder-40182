@@ -90,6 +90,7 @@ class RecordingSubmitRequest(BaseModel):
     call_id: Optional[str] = Field(None, description="业务系统通话ID（可选，用于关联）")
     customer_id: Optional[str] = Field(None, description="客户编号（可选）")
     call_start_time: Optional[datetime] = Field(None, description="通话开始时间（可选）")
+    mock_text: Optional[str] = Field(None, description="模拟转写文本（联调专用，传则优先使用此文本生成转写结果，录音地址可任意")
 
     class Config:
         json_schema_extra = {
@@ -187,6 +188,67 @@ class RiskAnalysisResponse(BaseModel):
                         "risk_level": "high",
                         "matched_keywords": ["加我微信", "微信号"],
                         "suggestion": "坐席违规引导客户添加私人微信，请立即约谈并加强培训。"
+                    }
+                ]
+            }
+        }
+
+
+class TaskSummary(BaseModel):
+    task_id: str = Field(..., description="任务ID")
+    status: TaskStatus = Field(..., description="任务状态")
+    agent_id: str = Field(..., description="坐席编号")
+    call_type: CallType = Field(..., description="通话类型")
+    call_id: Optional[str] = Field(None, description="业务系统通话ID")
+    submitted_at: datetime = Field(..., description="提交时间")
+    completed_at: Optional[datetime] = Field(None, description="完成时间")
+    duration_seconds: Optional[float] = Field(None, description="通话时长（秒）")
+    has_risk: bool = Field(False, description="是否有风险")
+    risk_count: int = Field(0, description="风险片段总数")
+    high_risk_count: int = Field(0, description="高风险及以上数量")
+    error_message: Optional[str] = Field(None, description="错误信息")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "task_id": "TASK_20240115_143022_ABC123",
+                "status": "completed",
+                "agent_id": "AGENT_8823",
+                "call_type": "outbound",
+                "call_id": "CALL_20240115_001",
+                "submitted_at": "2024-01-15T14:30:22.123456",
+                "completed_at": "2024-01-15T14:30:45.789012",
+                "duration_seconds": 185.5,
+                "has_risk": True,
+                "risk_count": 3,
+                "high_risk_count": 2,
+                "error_message": None
+            }
+        }
+
+
+class TaskListResponse(BaseModel):
+    total: int = Field(0, description="总任务数")
+    page: int = Field(1, description="当前页")
+    page_size: int = Field(20, description="每页数量")
+    items: List[TaskSummary] = Field(default_factory=list, description="任务列表")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "total": 42,
+                "page": 1,
+                "page_size": 20,
+                "items": [
+                    {
+                        "task_id": "TASK_20240115_143022_ABC123",
+                        "status": "completed",
+                        "agent_id": "AGENT_8823",
+                        "call_type": "outbound",
+                        "submitted_at": "2024-01-15T14:30:22.123456",
+                        "has_risk": True,
+                        "risk_count": 3,
+                        "high_risk_count": 2
                     }
                 ]
             }

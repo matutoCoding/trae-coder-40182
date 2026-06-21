@@ -3,7 +3,17 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from .schemas import TaskStatus, RecordingSubmitRequest, TranscriptResult, RiskAnalysisResponse
+from .schemas import (
+    TaskStatus,
+    RecordingSubmitRequest,
+    TranscriptResult,
+    RiskAnalysisResponse,
+    TaskSummary,
+    TaskListResponse,
+    RiskLevel,
+    RiskCategory,
+    Speaker,
+)
 from .storage import get_storage, TranscriptionTask
 from .asr_service import get_asr_service, ASRError, RecordingURLError, TranscriptionFailedError
 from .compliance_engine import get_compliance_engine
@@ -34,7 +44,7 @@ class TaskProcessor:
             task.started_at = datetime.now()
             self.storage.update_task(task)
 
-            segments = await self.asr.transcribe(task.recording_url)
+            segments = await self.asr.transcribe(task.recording_url, mock_text=task.mock_text)
             task.segments = segments
             if segments:
                 task.duration_seconds = round(segments[-1].end_time, 2)
@@ -94,6 +104,62 @@ class TaskProcessor:
         if not task:
             return None
         return task.to_risk_analysis_response()
+
+    def get_filtered_risks(
+        self,
+        task_id: str,
+        risk_level: Optional[RiskLevel] = None,
+        risk_category: Optional[RiskCategory] = None,
+        speaker: Optional[Speaker] = None,
+    ) -> Optional[RiskAnalysisResponse]:
+        task = self.storage.get_task(task_id)
+        if not task:
+            return None
+
+        risks = list(task.risks)
+        if risk_level:
+            risks = [r for r in risks if r.risk_level == risk_level]
+        if risk_category:
+            risks = [r for r in risks if r.risk_category == risk_category]
+        if speaker:
+            risks = [r for r in risks if r.speaker == speaker]
+
+        high = sum(1 for r in risks if r.risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL))
+        medium = sum(1 for r in risks if r.risk_level == RiskLevel.MEDIUM)
+        low = sum(1 for r in risks if r.risk_level == RiskLevel.LOW)
+
+        return RiskAnalysisResponse(
+            task_id=task.task_id,
+            status=task.status,
+            agent_id=task.agent_id,
+            total_risks=len(risks),
+            high_risk_count=high,
+            medium_risk_count=medium,
+            low_risk_count=low,
+            risks=risks,
+        )
+
+    def list_tasks(
+        self,
+        agent_id: Optional[str] = None,
+        status: Optional[TaskStatus] = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> TaskListResponse:
+        all_tasks = self.storage.list_tasks(agent_id=agent_id, status=status)
+        total = len(all_tasks)
+
+        start = (page - 1) * page_size
+        end = start + page_size
+        paged = all_tasks[start:end]
+
+        items = [t.to_task_summary() for t in paged]
+        return TaskListResponse(
+            total=total,
+            page=page,
+            page_size=page_size,
+            items=items,
+        )
 
 
 _processor_instance: Optional[TaskProcessor] = None

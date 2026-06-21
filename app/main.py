@@ -1,13 +1,19 @@
 import logging
-from fastapi import FastAPI, HTTPException
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from .config import settings
 from .schemas import (
+    TaskStatus,
+    RiskLevel,
+    RiskCategory,
+    Speaker,
     RecordingSubmitRequest,
     RecordingSubmitResponse,
     TranscriptResult,
     RiskAnalysisResponse,
+    TaskListResponse,
 )
 from .task_processor import get_task_processor
 
@@ -73,6 +79,35 @@ async def submit_recording(request: RecordingSubmitRequest):
 
 
 @app.get(
+    "/api/v1/tasks",
+    response_model=TaskListResponse,
+    tags=["Tasks"],
+    summary="查询任务列表",
+    description=(
+        "按坐席、状态查询任务列表，支持分页。\n\n"
+        "**筛选参数**：\n"
+        "- `agent_id`（可选）: 按坐席编号筛选\n"
+        "- `status`（可选）: 按任务状态筛选（pending/transcribing/analyzing/completed/failed）\n"
+        "- `page`: 页码，默认 1\n"
+        "- `page_size`: 每页数量，默认 20"
+    ),
+)
+async def list_tasks(
+    agent_id: Optional[str] = Query(None, description="坐席编号"),
+    status: Optional[TaskStatus] = Query(None, description="任务状态"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=200, description="每页数量"),
+):
+    processor = get_task_processor()
+    return processor.list_tasks(
+        agent_id=agent_id,
+        status=status,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.get(
     "/api/v1/tasks/{task_id}",
     response_model=TranscriptResult,
     tags=["Tasks"],
@@ -100,7 +135,7 @@ async def get_task_status(task_id: str):
     tags=["Tasks"],
     summary="获取风险检测结果",
     description=(
-        "获取通话中的合规风险片段列表。\n\n"
+        "获取通话中的合规风险片段列表，支持按风险等级、类别和说话人筛选。\n\n"
         "每个风险片段包含：\n"
         "- `original_text`: 原句内容\n"
         "- `speaker`: 说话人（agent/customer）\n"
@@ -114,9 +149,19 @@ async def get_task_status(task_id: str):
         404: {"description": "任务不存在"},
     },
 )
-async def get_task_risks(task_id: str):
+async def get_task_risks(
+    task_id: str,
+    risk_level: Optional[RiskLevel] = Query(None, description="按风险等级筛选"),
+    risk_category: Optional[RiskCategory] = Query(None, description="按风险类别筛选"),
+    speaker: Optional[Speaker] = Query(None, description="按说话人筛选"),
+):
     processor = get_task_processor()
-    result = processor.get_task_risks(task_id)
+    result = processor.get_filtered_risks(
+        task_id=task_id,
+        risk_level=risk_level,
+        risk_category=risk_category,
+        speaker=speaker,
+    )
     if result is None:
         raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
     return result
