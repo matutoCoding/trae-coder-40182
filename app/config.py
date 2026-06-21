@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     debug: bool = True
 
     asr_mock_mode: bool = True
-    asr_mock_delay_seconds: int = 3
+    asr_mock_delay_seconds: int = 1
 
     storage_type: str = "memory"
 

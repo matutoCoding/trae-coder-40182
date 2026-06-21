@@ -1,10 +1,11 @@
 import asyncio
 import logging
 from datetime import datetime
+from typing import Optional
 
 from .schemas import TaskStatus, RecordingSubmitRequest, TranscriptResult, RiskAnalysisResponse
 from .storage import get_storage, TranscriptionTask
-from .asr_service import get_asr_service
+from .asr_service import get_asr_service, ASRError, RecordingURLError, TranscriptionFailedError
 from .compliance_engine import get_compliance_engine
 
 logger = logging.getLogger(__name__)
@@ -54,27 +55,48 @@ class TaskProcessor:
                 f"Segments: {len(segments)}, Risks: {len(risks)}"
             )
 
-        except Exception as e:
-            logger.exception(f"Task {task_id} failed")
+        except RecordingURLError as e:
+            logger.error(f"Task {task_id} recording URL error: {e}")
             task.status = TaskStatus.FAILED
-            task.error_message = str(e)
+            task.error_message = f"录音地址无效: {e}"
             task.completed_at = datetime.now()
             self.storage.update_task(task)
 
-    def get_task_status(self, task_id: str) -> TranscriptResult | None:
+        except TranscriptionFailedError as e:
+            logger.error(f"Task {task_id} transcription failed: {e}")
+            task.status = TaskStatus.FAILED
+            task.error_message = f"转写失败: {e}"
+            task.completed_at = datetime.now()
+            self.storage.update_task(task)
+
+        except ASRError as e:
+            logger.error(f"Task {task_id} ASR error: {e}")
+            task.status = TaskStatus.FAILED
+            task.error_message = f"语音识别服务异常: {e}"
+            task.completed_at = datetime.now()
+            self.storage.update_task(task)
+
+        except Exception as e:
+            logger.exception(f"Task {task_id} unexpected error")
+            task.status = TaskStatus.FAILED
+            task.error_message = f"处理异常: {e}"
+            task.completed_at = datetime.now()
+            self.storage.update_task(task)
+
+    def get_task_status(self, task_id: str) -> Optional[TranscriptResult]:
         task = self.storage.get_task(task_id)
         if not task:
             return None
         return task.to_transcript_result()
 
-    def get_task_risks(self, task_id: str) -> RiskAnalysisResponse | None:
+    def get_task_risks(self, task_id: str) -> Optional[RiskAnalysisResponse]:
         task = self.storage.get_task(task_id)
         if not task:
             return None
         return task.to_risk_analysis_response()
 
 
-_processor_instance: TaskProcessor | None = None
+_processor_instance: Optional[TaskProcessor] = None
 
 
 def get_task_processor() -> TaskProcessor:
